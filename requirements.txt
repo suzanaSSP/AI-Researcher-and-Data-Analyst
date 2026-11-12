@@ -8,3 +8,4 @@ langgraph_supervisor
 langchain_google_genai
 python-dotenv
 deepagents
+langsmith
