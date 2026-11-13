@@ -30,6 +30,15 @@ def search_web(query: str) -> str:
     except Exception as e:
         return f"Web search temporarily returned an error ({e}). Please synthesize your answer using your foundational knowledge."
 
+@tool
+def check_file_exists(file_path: str) -> str:
+    """Checks whether a file exists on disk.
+    Use this to verify if cleaned or processed datasets already exist before running code.
+    """
+    if os.path.exists(file_path):
+        return f"File '{file_path}' EXISTS and is ready for use."
+    return f"File '{file_path}' DOES NOT exist."
+
 query_refiner_prompt = (
     "You are a query refiner agent.\n\n"
     "INSTRUCTIONS:\n"
@@ -40,19 +49,21 @@ query_refiner_prompt = (
 data_cleaning_prompt = (
     "You are an expert Data Cleaning and Preparation Agent.\n\n"
     "OBJECTIVE:\n"
-    "Inspect, sanitize, and validate the input dataset so it is robust and ready for statistical analysis. If the data is already cleaned don't change it.\n\n"
+    "Inspect, sanitize, and validate the dataset so it is robust for statistical analysis.\n\n"
     "INSTRUCTIONS:\n"
-    "1. Schema & Types: Inspect column names, data types, and shape. Standardize column names (snake_case, no whitespace) and cast columns to correct types (e.g., parse dates, numeric types).\n"
-    "2. Missing Values: Identify null/missing values across all fields. Apply appropriate strategies (justified imputation or removal) and document why.\n"
-    "3. Duplicates & Anomalies: Identify and drop duplicate rows. Flag or handle domain-specific invalid values (e.g., negative prices, erroneous future dates).\n"
-    "4. Text & Categoricals: Strip extraneous whitespace, standardize casing, and handle unknown categories.\n"
-    "5. Persistence: Save the resulting dataset (e.g., 'cleaned_data.csv') and ensure it is ready for downstream agents.\n\n"
+    "1. Check Existing Cache FIRST:\n"
+    "   - Use `check_file_exists` on the expected target output (e.g., 'cleaned_student_data.csv' or 'cleaned_data.csv').\n"
+    "   - If the file ALREADY EXISTS, DO NOT re-run cleaning code. Immediately return a report confirming the cleaned file is ready, along with its path.\n"
+    "2. If the file does NOT exist:\n"
+    "   - Load the raw data with python_repl_tool.\n"
+    "   - Standardize column names, handle missing values/duplicates, cast correct types.\n"
+    "   - Save the result to 'cleaned_student_data.csv'.\n\n"
     "OUTPUT CONTRACT:\n"
-    "Provide a concise Data Cleaning Report containing:\n"
-    "- Initial vs. final dataset dimensions (rows x columns)\n"
-    "- Summary of transformations (imputations made, rows dropped, types converted)\n"
+    "Provide a concise summary:\n"
+    "- Status: (Existing file reused / New file cleaned)\n"
     "- File path of the cleaned dataset"
 )
+
 
 eda_prompt = (
     "You are an expert Exploratory Data Analysis (EDA) Agent.\n\n"
@@ -115,7 +126,7 @@ query_refiner_agent = create_react_agent(
 
 cleaner_agent = create_react_agent(
     model=model,
-    tools=[python_repl_tool], # e.g. python code execution / file tools
+    tools=[check_file_exists, python_repl_tool], # e.g. python code execution / file tools
     prompt=data_cleaning_prompt,
     name="data_cleaning_agent"
 )
