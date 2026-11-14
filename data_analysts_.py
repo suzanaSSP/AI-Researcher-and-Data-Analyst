@@ -1,4 +1,7 @@
-from langchain_core import language_models
+from langgraph.graph import StateGraph, START, END
+from typing import TypedDict, Annotated, Optional
+from langchain_core.messages import BaseMessage, AIMessage
+from langgraph.graph.message import add_messages
 import re
 import streamlit as st
 from langchain_experimental.tools import PythonREPLTool
@@ -7,28 +10,50 @@ from ddgs import DDGS
 from langgraph.prebuilt import create_react_agent
 from langgraph_supervisor import create_supervisor
 
-from langchain_google_genai import ChatGoogleGenerativeAI
-
-# from groq import Groq
+from langchain_groq import ChatGroq
 from dotenv import load_dotenv
 import os
 
 load_dotenv()
-model = ChatGoogleGenerativeAI(model="gemini-3.5-flash", api_key=os.getenv("GEMINI_API_KEY"))
 
-@tool
-def search_web(query: str) -> str:
-    """Search the web for up-to-date information, references, and articles."""
-    try:
-        results = list(DDGS().text(query, max_results=3))
-        if not results:
-            return "No web results found for this query. Please synthesize using your foundational knowledge."
-        formatted = []
-        for r in results:
-            formatted.append(f"Title: {r.get('title')}\nLink: {r.get('href')}\nSnippet: {r.get('body')}")
-        return "\n\n".join(formatted)
-    except Exception as e:
-        return f"Web search temporarily returned an error ({e}). Please synthesize your answer using your foundational knowledge."
+# Connect to LangSmith for full tracing of all agent steps and tools
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+if os.getenv("LANGSMITH_API_KEY") and not os.getenv("LANGCHAIN_API_KEY"):
+    os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGSMITH_API_KEY")
+os.environ.setdefault("LANGCHAIN_PROJECT", "ai-data-analyst")
+
+# Groq-hosted Qwen model (max_tokens set to 1000 per Groq OTPM rate limits)
+model = ChatGroq(
+    model_name="qwen/qwen3.8-27b",
+    api_key=os.getenv("GROQ_API_KEY"),
+    max_tokens=1000
+)
+
+class PipelineState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+    cleaned_data_path: Optional[str]
+    eda_code: Optional[list[str]]             
+    viz_code: Optional[list[str]]             
+    visualizations_dir: Optional[str]
+    visualization_files: Optional[list[str]]
+    report: Optional[str]
+    task: Optional[str]
+
+
+
+# @tool
+# def search_web(query: str) -> str:
+#     """Search the web for up-to-date information, references, and articles."""
+#     try:
+#         results = list(DDGS().text(query, max_results=3))
+#         if not results:
+#             return "No web results found for this query. Please synthesize using your foundational knowledge."
+#         formatted = []
+#         for r in results:
+#             formatted.append(f"Title: {r.get('title')}\nLink: {r.get('href')}\nSnippet: {r.get('body')}")
+#         return "\n\n".join(formatted)
+#     except Exception as e:
+#         return f"Web search temporarily returned an error ({e}). Please synthesize your answer using your foundational knowledge."
 
 @tool
 def check_file_exists(file_path: str) -> str:
@@ -38,6 +63,21 @@ def check_file_exists(file_path: str) -> str:
     if os.path.exists(file_path):
         return f"File '{file_path}' EXISTS and is ready for use."
     return f"File '{file_path}' DOES NOT exist."
+
+def extract_executed_code(messages: list[BaseMessage]) -> list[str]:
+    """Extracts all Python code snippets passed to python_repl_tool."""
+    code_snippets = []
+    for msg in messages:
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            for tc in msg.tool_calls:
+                # Catches both 'query' and 'code' argument names
+                if "python" in tc.get("name", "").lower() or "repl" in tc.get("name", "").lower():
+                    code = tc.get("args", {}).get("query") or tc.get("args", {}).get("code") or ""
+                    if code:
+                        code_snippets.append(code.strip())
+    return code_snippets
+
+
 
 query_refiner_prompt = (
     "You are a query refiner agent.\n\n"
@@ -133,7 +173,7 @@ cleaner_agent = create_react_agent(
 
 eda_agent = create_react_agent(
     model=model,
-    tools=[python_repl_tool],
+    tools=[check_file_exists, python_repl_tool],
     prompt=eda_prompt,
     name="eda_agent"
 )
@@ -145,18 +185,99 @@ viz_agent = create_react_agent(
     name="analysis_viz_agent"
 )
 
+def query_refiner_node(state: PipelineState) -> dict:
+    print("\n" + "=" * 55, flush=True)
+    print("🔍 [TASK STARTED]: Query Refinement", flush=True)
+    print("=" * 55, flush=True)
+    return query_refiner_agent.invoke(state)
 
-# Create the supervisor agent
-supervisor_agent = create_supervisor(
-    model=model,
-    agents=[query_refiner_agent, cleaner_agent, eda_agent, viz_agent],
-    prompt=supervisor_prompt
+def cleaner_node(state: PipelineState) -> dict:
+    print("\n" + "=" * 55, flush=True)
+    print("🧹 [TASK STARTED]: Data Cleaning & Sanitation", flush=True)
+    print("=" * 55, flush=True)
+    return cleaner_agent.invoke(state)
+
+def eda_node(state: PipelineState) -> dict:
+    print("\n" + "=" * 55, flush=True)
+    print("🔬 [TASK STARTED]: Exploratory Data Analysis (EDA)", flush=True)
+    print("=" * 55, flush=True)
+    initial_count = len(state.get("messages", []))
+    result = eda_agent.invoke(state)
+    
+    # Extract only the code executed during THIS agent's turn
+    new_messages = result["messages"][initial_count:]
+    code_list = extract_executed_code(new_messages)
+    
+    print(f"\n📝 [EDA COMPLETED]: Captured {len(code_list)} executed code snippet(s).", flush=True)
+    return {
+        "messages": result["messages"],
+        "eda_code": code_list
+    }
+
+def viz_node(state: PipelineState) -> dict:
+    print("\n" + "=" * 55, flush=True)
+    print("📊 [TASK STARTED]: Analysis & Visualizations", flush=True)
+    print("=" * 55, flush=True)
+    initial_count = len(state.get("messages", []))
+    result = viz_agent.invoke(state)
+    
+    new_messages = result["messages"][initial_count:]
+    code_list = extract_executed_code(new_messages)
+    
+    # Optional: collect generated image paths
+    viz_dir = state.get("visualizations_dir") or "visualizations"
+    chart_files = []
+    if os.path.exists(viz_dir):
+        chart_files = [os.path.join(viz_dir, f) for f in os.listdir(viz_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.svg'))]
+        
+    print(f"\n📈 [VIZ COMPLETED]: Captured {len(code_list)} code snippet(s) and {len(chart_files)} chart(s).", flush=True)
+    return {
+        "messages": result["messages"],
+        "viz_code": code_list,
+        "visualization_files": chart_files
+    }
+
+
+def check_cleaned_data_exists(state: PipelineState) -> str:
+    """Checks whether the cleaned dataset exists on disk before letting EDA proceed."""
+    cleaned_path = state.get("cleaned_data_path") or "cleaned_student_data.csv"
+    if os.path.exists(cleaned_path):
+        print(f"\n✅ Cleaned data found at '{cleaned_path}'. Proceeding to EDA...", flush=True)
+        return "eda_agent"
+    print(f"\n❌ Cleaned data NOT found at '{cleaned_path}'. Going to cleaner agent", flush=True)
+    return "cleaner_agent"
+
+
+builder = StateGraph(PipelineState)
+builder.add_node('query_refiner', query_refiner_node)
+builder.add_node('cleaner_agent', cleaner_node)
+builder.add_node('eda_agent', eda_node)
+builder.add_node('viz_agent', viz_node)
+
+builder.add_edge(START, 'query_refiner')
+
+# After query refinement, check if cleaned data already exists:
+# - If YES -> skip straight to eda_agent
+# - If NO  -> route to cleaner_agent
+builder.add_conditional_edges(
+    'query_refiner',
+    check_cleaned_data_exists,
+    {
+        'eda_agent': 'eda_agent',
+        'cleaner_agent': 'cleaner_agent'
+    }
 )
 
-app = supervisor_agent.compile()
+# If cleaner runs, proceed to eda_agent next
+builder.add_edge('cleaner_agent', 'eda_agent')
+builder.add_edge('eda_agent', 'viz_agent')
+builder.add_edge('viz_agent', END)
 
+graph = builder.compile()
 
-print("\nStarting multi-agent researcher...\n")
+png_bytes = graph.get_graph().draw_mermaid_png()
+with open("pipeline_graph.png", "wb") as f:
+    f.write(png_bytes)
 
 inputs = {
     "messages": [
@@ -168,35 +289,56 @@ inputs = {
                 "and generate visualizations with strategic insights."
             ),
         }
-    ]
+    ],
+    "cleaned_data_path": "cleaned_student_data.csv",
+    "visualizations_dir": "visualizations"
 }
-
 
 if __name__ == "__main__":
     print("\n" + "=" * 65, flush=True)
-    print("🚀 STARTING MULTI-AGENT DATA ANALYST PIPELINE", flush=True)
+    print("🚀 STARTING STATE GRAPH DATA ANALYST PIPELINE", flush=True)
     print("=" * 65 + "\n", flush=True)
-    print("⏳ Contacting supervisor to orchestrate the pipeline...\n", flush=True)
 
+    final_state = {}
     # Use stream_mode="updates" to get notified as each agent node executes
-    for chunk in app.stream(inputs, stream_mode="updates"):
+    for chunk in graph.stream(inputs, stream_mode="updates"):
         for node_name, update in chunk.items():
-            print(f"\n{'='*20} 🤖 AGENT CALLED: [{node_name.upper()}] {'='*20}", flush=True)
+            if isinstance(update, dict):
+                final_state.update(update)
+            print(f"\n{'='*20} 🤖 NODE FINISHED: [{node_name.upper()}] {'='*20}", flush=True)
             
             node_messages = update.get("messages", []) if isinstance(update, dict) else []
             for msg in node_messages:
-                # Check if supervisor is delegating to a sub-agent
+                # Check for tool calls
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
                     for tc in msg.tool_calls:
-                        target_agent = tc.get("name", "unknown")
-                        print(f"👉 Delegating to sub-agent / tool: [{target_agent}]", flush=True)
+                        target_tool = tc.get("name", "unknown")
+                        args = tc.get("args", {})
+                        code_preview = args.get("query") or args.get("code") or args.get("file_path") or ""
+                        print(f"👉 [TOOL CALL]: {target_tool}", flush=True)
+                        if code_preview:
+                            first_line = str(code_preview).strip().split("\n")[0][:80]
+                            print(f"   Executing: {first_line}...", flush=True)
                 
-                # Pretty-print the agent's thought process and outputs
+                # Pretty-print the message
                 if hasattr(msg, "pretty_print"):
                     msg.pretty_print()
                     print(flush=True)
                 elif hasattr(msg, "content"):
                     print(f"[{node_name}]: {msg.content}\n", flush=True)
+
+    print("\n" + "=" * 65, flush=True)
+    print("🎉 PIPELINE EXECUTION COMPLETED!", flush=True)
+    print("=" * 65, flush=True)
+    if final_state.get("eda_code"):
+        print(f"• EDA Code Snippets Stored: {len(final_state['eda_code'])}", flush=True)
+    if final_state.get("viz_code"):
+        print(f"• Viz Code Snippets Stored: {len(final_state['viz_code'])}", flush=True)
+    if final_state.get("visualization_files"):
+        print(f"• Generated Visualizations ({len(final_state['visualization_files'])}):", flush=True)
+        for cf in final_state["visualization_files"]:
+            print(f"   - {cf}", flush=True)
+    print("=" * 65 + "\n", flush=True)
 
 # Query refiner
 # cleaning data

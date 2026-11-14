@@ -9,3 +9,5 @@ langchain_google_genai
 python-dotenv
 deepagents
 langsmith
+langchain-groq
+groq
